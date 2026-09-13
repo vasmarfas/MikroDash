@@ -2,6 +2,64 @@
 
 All notable changes to MikroDash will be documented in this file.
 
+## [0.8.54] - Dashboard cards stop freezing, and routers stop dropping their connection
+
+A fixes release on top of 0.8.53.
+
+### Fixed
+
+- **Dashboard cards no longer freeze on a router after a few hours.** On 0.8.53
+  System, Connections, Bandwidth, Talkers and other cards could stop updating
+  until MikroDash was restarted, and switching routers could stop working too.
+- **Routers stop briefly dropping and reconnecting.** The same underlying cause
+  made older versions disconnect from a router every so often.
+- **The NetWatch and Firewall cards stay fresh on a quiet router.** They went
+  stale whenever nothing on the router had changed.
+
+### Internal
+
+- MikroDash now uses a patched copy of the go-routeros library, which could lose
+  a router's reply to a command. A command that still gets no reply is cancelled
+  on the router and named in the log.
+
+## [0.8.53] - Saving settings no longer crashes, and a slow router stops dropping its connection
+
+A fixes release on top of 0.8.52, including a contributed fix for settings saves.
+
+### Fixed
+
+- **A slow RouterOS command no longer disconnects the router.** One command that
+  took longer than its timeout used to end the whole connection, so routers
+  dropped and reconnected, often right after MikroDash started.
+- **The orange "RouterOS not connected" banner only shows for the router you are
+  viewing.** Another router dropping lit it over a healthy one.
+- **The Dashboard's Networks card no longer goes stale minutes after loading.**
+  A ping stream that ended quietly is now reopened.
+- **Each router pings its own ping target.** Every router pinged the default
+  `1.1.1.1` whatever its device settings said. Editing the target takes effect
+  without reconnecting, so latency on the Dashboard and in Reports now measures
+  the target you set.
+- **A disconnect in the log says why.** It reads whether the router ended the
+  session, with the router's reason, or the connection was lost on the way.
+- **The Dashboard asks for less when it loads.** Each card subscribes once
+  instead of three times, and nothing is requested before a router is selected.
+- **An idle collector on the router you are viewing stays asleep.** It woke
+  itself every couple of minutes to read a menu the router does not have.
+
+### Merged contributions
+
+Thanks to [@omegaatt36](https://github.com/omegaatt36).
+
+- **Saving settings no longer crashes** ([#133](https://github.com/SecOps-7/MikroDash/pull/133)).
+  Since 0.8.0 the first settings save after startup failed in the Docker image,
+  and poll interval changes then stopped applying until a restart.
+
+### Internal
+
+- New tests pin that a timed-out command leaves the connection up and holds its
+  router slot until the router answers, and that the poll map works outside the
+  source tree.
+
 ## [0.8.52] - The update dialog closes itself, and quiet routers stop looking stale
 
 A fixes release on top of 0.8.51.

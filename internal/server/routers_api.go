@@ -383,6 +383,10 @@ func (s *Server) reconfigureLiveSession(id string) {
 		Username: rec.Username, Password: rec.Password,
 		TLS: rec.TLS, InsecureTLS: rec.TLSInsecure,
 	})
+	// AND THE PING TARGET, which is not part of the connection and so does not
+	// redial. A router held for alerting or recording never has its session
+	// rebuilt, so without this an edited target waited for a restart.
+	s.sessions.ApplyPingTarget(id, rec.PingTarget)
 }
 
 // routerDelete removes a router and everything that only made sense with it.
@@ -446,6 +450,13 @@ func (s *Server) routerDelete(w http.ResponseWriter, r *http.Request) {
 		// behind it is a live outbound email loop.
 		if _, err := s.auditDB.DeleteReportSchedulesForRouter(id); err != nil {
 			log.Printf("[routers] schedules for %s: %v", id, err)
+		}
+		// The site plan, the declared uplinks and the pinned cabling. NOT part of
+		// `DeleteRouterData`: that list is frozen against the live source and
+		// fails in both directions, and these are not time-series rows. Left
+		// behind they would point at an id a later Add Router could reuse.
+		if _, err := s.auditDB.DeleteRouterDocs(id); err != nil {
+			log.Printf("[routers] docs for %s: %v", id, err)
 		}
 	}
 	EvPermsChanged.BroadcastAll(s.hub, map[string]any{})

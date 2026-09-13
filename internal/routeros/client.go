@@ -51,6 +51,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"os"
@@ -133,6 +134,16 @@ type Config struct {
 	Label string
 }
 
+// name is what a log line calls this router: its label, or its host. Live tags
+// the client `routerCfg.label || routerCfg.host`, because three routers tracing
+// at once are unreadable without it.
+func (cfg Config) name() string {
+	if cfg.Label != "" {
+		return cfg.Label
+	}
+	return cfg.Host
+}
+
 const defaultDialTimeout = 15 * time.Second
 
 // debugHandler is the slog handler to install, or NIL when tracing is off.
@@ -149,12 +160,7 @@ func debugHandler(cfg Config, w io.Writer) slog.Handler {
 	if !cfg.Debug {
 		return nil
 	}
-	label := cfg.Label
-	if label == "" {
-		// Live tags the client `routerCfg.label || routerCfg.host`. Three routers
-		// tracing at once are unreadable without it.
-		label = cfg.Host
-	}
+	label := cfg.name()
 	h := slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})
 	return h.WithAttrs([]slog.Attr{slog.String("router", label)})
 }
@@ -163,9 +169,35 @@ func debugHandler(cfg Config, w io.Writer) slog.Handler {
 type Cmd struct {
 	Path string
 	Args []string
-	// Timeout bounds a one-shot call. Zero means no bound, which is correct for
-	// a stream and wrong for everything else.
+	// Timeout bounds how long Do WAITS for a one-shot call. Zero means no bound,
+	// which is correct for a stream and wrong for everything else. Past it the
+	// command is cancelled on the router: see Do.
 	Timeout time.Duration
+	// Finished, if set, runs exactly once when the command is really over — its
+	// reply arrived, it failed, or the connection went — which after a timeout
+	// is later than Do returning. A router slot is released here. Chain onto it
+	// with OnFinished rather than assigning, so an earlier hook is kept.
+	Finished func()
+}
+
+// OnFinished returns the command with f added to what runs when it is over.
+func (c Cmd) OnFinished(f func()) Cmd {
+	prev := c.Finished
+	c.Finished = func() {
+		f()
+		if prev != nil {
+			prev()
+		}
+	}
+	return c
+}
+
+// Finish runs the Finished hooks, for a caller that returns before issuing the
+// command at all.
+func (c Cmd) Finish() {
+	if c.Finished != nil {
+		c.Finished()
+	}
 }
 
 // words is the sentence go-routeros wants: the path, then each argument.
@@ -194,6 +226,16 @@ type Client struct {
 	// go-routeros parks a goroutine on context.Background() for the life of the
 	// process, once per client ever dialled.
 	cancel context.CancelFunc
+
+	// watch is the connection's `!fatal` watcher: the reason a router gave for
+	// ending the session, if it gave one. Nil on a Client not built by Dial.
+	watch *fatalWatch
+
+	// tags reads the tag each command goes out with, which `/cancel` needs. Nil
+	// on a Client not built by Dial, which then cannot cancel a command.
+	tags *tagWatch
+	// issuing is held while one command is written. See send.
+	issuing sync.Mutex
 }
 
 // Dial connects, logs in and starts async mode.
@@ -204,24 +246,47 @@ func Dial(cfg Config) (*Client, error) {
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
+	// ── THE CONNECTION IS OPENED HERE, NOT BY THE LIBRARY ─────────────────
+	//
+	// `ros.DialTimeout` / `ros.DialTLSTimeout` are exactly a dial, `NewClient`
+	// and `LoginContext` under one deadline (client.go in go-routeros v3.0.1).
+	// Doing those three here is what lets `fatalWatch` wrap the connection, which
+	// is the only place the router's `!fatal` reason can still be seen — the
+	// library's async loop discards it. The error text keeps the library's
+	// prefixes, "could not connect to router os" and "could not login", so
+	// TestConnReason and safe.Message read it as before.
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), timeout)
+	defer dialCancel()
 	var (
-		inner *ros.Client
-		err   error
+		conn net.Conn
+		err  error
 	)
 	if cfg.TLS {
 		// RouterOS ships a self-signed certificate. InsecureSkipVerify mirrors
 		// the Node deployment's rejectUnauthorized:false rather than inventing a
 		// stricter policy every existing router would fail.
-		inner, err = ros.DialTLSTimeout(addr, cfg.Username, cfg.Password,
-			&tls.Config{InsecureSkipVerify: cfg.InsecureTLS}, timeout) //nolint:gosec // see above
+		conn, err = (&tls.Dialer{Config: &tls.Config{InsecureSkipVerify: cfg.InsecureTLS}}). //nolint:gosec // see above
+													DialContext(dialCtx, "tcp", addr)
 	} else {
-		inner, err = ros.DialTimeout(addr, cfg.Username, cfg.Password, timeout)
+		conn, err = new(net.Dialer).DialContext(dialCtx, "tcp", addr)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not connect to router os: %w", err)
+	}
+	watch := newFatalWatch(conn)
+	// And the write side, for the tag each command goes out with: see tagWatch.
+	tags := newTagWatch(watch)
+	inner, err := ros.NewClient(tags)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("could not connect to router os: %w", err)
+	}
+	if err := inner.LoginContext(dialCtx, cfg.Username, cfg.Password); err != nil {
+		_ = inner.Close()
+		return nil, fmt.Errorf("could not login: %w", err)
 	}
 
-	cl := &Client{cfg: cfg, c: inner}
+	cl := &Client{cfg: cfg, c: inner, watch: watch, tags: tags}
 
 	// ── PROTOCOL TRACING, OFF UNLESS THE OPERATOR ASKED ───────────────────
 	//
@@ -260,11 +325,7 @@ func Dial(cfg Config) (*Client, error) {
 		// Async() closes this channel when the read loop ends. A closed channel
 		// with no value is a clean shutdown; a value is what ended it.
 		if e, ok := <-errC; ok && e != nil {
-			cl.mu.Lock()
-			if cl.fatal == nil {
-				cl.fatal = e
-			}
-			cl.mu.Unlock()
+			cl.record(e)
 		}
 	}()
 
@@ -272,23 +333,171 @@ func Dial(cfg Config) (*Client, error) {
 }
 
 // Do issues a command and returns every row of the reply.
+//
+// ── A TIMEOUT ENDS THE WAIT AT ONCE, AND THE COMMAND SOON AFTER ─────────────
+//
+// It used to give the library a context with the deadline. go-routeros's async
+// RunArgsContext answers a finished context with `c.r.Cancel()` (run.go) — on
+// the reader the WHOLE connection shares — and a cancelled read returns io.EOF
+// (proto/io_context.go). So ONE command past its deadline ended EVERY command on
+// the connection, and the session logged "connection closed without a !fatal
+// from the router: EOF". On 2026-09-13 the cAP AX and CHR Test both dropped 15 s
+// after a restart, the session's default deadline, while every collector made
+// its first read at once.
+//
+// So the library gets a context nothing cancels, and the deadline is this
+// function's own timer. When it fires the caller gets a timeout at once, and the
+// command is cancelled ON THE ROUTER, by its tag (see abandon). `cmd.Finished`
+// marks the moment it is really over, exactly once, on every path.
 func (c *Client) Do(cmd Cmd) ([]Reply, error) {
+	finish := sync.OnceFunc(cmd.Finish)
 	if err := c.err(); err != nil {
+		finish()
 		return nil, err
 	}
 
-	ctx := context.Background()
+	type result struct {
+		reply *ros.Reply
+		err   error
+	}
+	out := make(chan result, 1)
+	ended := make(chan struct{})
+	tag := c.send(func() <-chan struct{} {
+		go func() {
+			// `ended` closes AFTER the Finished hooks, so whatever waits on it sees
+			// the router slot already given back.
+			defer close(ended)
+			defer finish()
+			reply, err := c.c.RunArgsContext(context.Background(), cmd.words())
+			if err != nil {
+				// Wrapped even when nobody is waiting: a transport failure still
+				// has to be recorded as what ended the connection.
+				err = c.wrap(err)
+			}
+			out <- result{reply, err}
+		}()
+		return ended
+	})
+
+	// No timeout, no timer: a nil channel never fires.
+	var expired <-chan time.Time
 	if cmd.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cmd.Timeout)
-		defer cancel()
+		timer := time.NewTimer(cmd.Timeout)
+		defer timer.Stop()
+		expired = timer.C
 	}
-
-	reply, err := c.c.RunArgsContext(ctx, cmd.words())
-	if err != nil {
-		return nil, c.wrap(err)
+	select {
+	case r := <-out:
+		if r.err != nil {
+			return nil, r.err
+		}
+		return rowsOf(r.reply), nil
+	case <-expired:
+		go c.abandon(cmd, tag, ended)
+		// NOT through wrap: a timeout is not a connection failure, and the
+		// connection is, by construction, still up.
+		return nil, fmt.Errorf("routeros: timed out: %w", context.DeadlineExceeded)
 	}
+}
 
+// send issues one command sentence and returns the tag it went out with.
+//
+// `write` starts a library call that writes exactly one sentence, and returns a
+// channel that closes once that call has returned.
+//
+// ── ONE COMMAND IS WRITTEN AT A TIME ────────────────────────────────────────
+//
+// go-routeros picks each tag itself and does not say which, and `/cancel` needs
+// it. The tag watcher sees every sentence written, in order, but not whose it
+// is. EVERY writer in this file holds `issuing` until its sentence is on the
+// wire, so the next sentence the watcher frames is this one. The lock is let go
+// as soon as the sentence is written, not when its reply comes, so a slow
+// command holds nobody else up.
+//
+// "" means no tag was seen: a client with no watcher, or a call that ended
+// without writing anything.
+func (c *Client) send(write func() <-chan struct{}) string {
+	c.issuing.Lock()
+	defer c.issuing.Unlock()
+	if c.tags == nil {
+		write()
+		return ""
+	}
+	c.tags.forget()
+	ended := write()
+	select {
+	case tag := <-c.tags.sent:
+		return tag
+	case <-ended:
+		// The call is over. If it wrote, its tag is already waiting.
+		select {
+		case tag := <-c.tags.sent:
+			return tag
+		default:
+			return ""
+		}
+	}
+}
+
+// alreadyEnded is a closed channel, for a `send` whose call has returned by the
+// time it hands the channel back.
+var alreadyEnded = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+// cancelGrace is how long a cancelled command has to end before the connection
+// is given up on. A variable so a test need not wait it out.
+var cancelGrace = 5 * time.Second
+
+// abandon cancels a command whose caller has stopped waiting for it.
+//
+// ── WHY IT IS NOT LEFT TO RUN ON ────────────────────────────────────────────
+//
+// 0.8.53 left it running until its reply came, and on a live router some never
+// came. On 2026-09-13 the hAP AX3 held all eight of its router slots with
+// commands it had not answered, gathered at about one every 26 minutes — the
+// rate the EOF drops had run at — and every poll on that router then waited for
+// a slot for ever, with nothing in the log.
+//
+// A cancelled command ends with a `!trap` (category 2, "interrupted"), which
+// closes it in the library: its Finished hooks run and its slot comes back. If
+// it has not ended within cancelGrace, the connection is marked failed. The
+// session's and the Devices pool's connect loops see Connected() go false and
+// redial, and closing the old client ends every command still open on it.
+func (c *Client) abandon(cmd Cmd, tag string, ended <-chan struct{}) {
+	select {
+	case <-ended:
+		return // the reply came as the timer fired
+	default:
+	}
+	how := "could not be cancelled"
+	if tag != "" {
+		how = "did not end when cancelled"
+		log.Printf("[routeros] %s: %s had no reply in %s; cancelling it", c.cfg.name(), cmd.Path, cmd.Timeout)
+		// In a goroutine of its own: `send` waits its turn to write, and a
+		// connection whose writes are stuck must still reach the grace timer.
+		go c.send(func() <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = c.c.RunArgsContext(context.Background(), []string{"/cancel", "=tag=" + tag})
+			}()
+			return done
+		})
+	}
+	grace := time.NewTimer(cancelGrace)
+	defer grace.Stop()
+	select {
+	case <-ended:
+	case <-grace.C:
+		c.record(fmt.Errorf("%s had no reply in %s and %s", cmd.Path, cmd.Timeout+cancelGrace, how))
+	}
+}
+
+// rowsOf turns a library reply into this package's rows.
+func rowsOf(reply *ros.Reply) []Reply {
 	out := make([]Reply, 0, len(reply.Re))
 	for _, sen := range reply.Re {
 		if sen == nil {
@@ -301,7 +510,7 @@ func (c *Client) Do(cmd Cmd) ([]Reply, error) {
 		// 500-row connection table for no gain.
 		out = append(out, Reply(sen.Map))
 	}
-	return out, nil
+	return out
 }
 
 // Stream subscribes to a /listen or an `=interval=` print, calling onRow for
@@ -329,7 +538,11 @@ func (c *Client) StreamUntilDone(cmd Cmd, onRow func(Reply), onDone func()) (sto
 		return nil, err
 	}
 
-	lr, err := c.c.ListenArgs(cmd.words())
+	var lr *ros.ListenReply
+	c.send(func() <-chan struct{} {
+		lr, err = c.c.ListenArgs(cmd.words())
+		return alreadyEnded
+	})
 	if err != nil {
 		return nil, c.wrap(err)
 	}
@@ -359,7 +572,15 @@ func (c *Client) StreamUntilDone(cmd Cmd, onRow func(Reply), onDone func()) (sto
 			// the connection may already be gone — and a stop that reported that
 			// would make every teardown path handle an error it can do nothing
 			// about.
-			_, _ = lr.Cancel()
+			cancelled := make(chan struct{})
+			c.send(func() <-chan struct{} {
+				go func() {
+					defer close(cancelled)
+					_, _ = lr.Cancel()
+				}()
+				return cancelled
+			})
+			<-cancelled
 			<-done
 		})
 	}, nil
@@ -384,13 +605,57 @@ func (c *Client) wrap(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("routeros: timed out: %w", err)
 	}
+	c.record(err)
+	return err
+}
+
+// record keeps the FIRST failure that ended this connection, told with the
+// reason the router gave, if it gave one. Both writers of `fatal` — `wrap`, for a
+// command that failed, and the async loop's end — come through here, so which of
+// the two gets there first does not decide what the log says.
+func (c *Client) record(err error) {
+	err = c.explain(err)
 	c.mu.Lock()
 	if c.fatal == nil {
 		c.fatal = err
 	}
 	c.mu.Unlock()
+}
+
+// explain attaches what the watcher saw to a failure. By the time a read has
+// failed, every byte before it has passed the watcher, so its answer is final.
+func (c *Client) explain(err error) error {
+	if c.watch == nil {
+		return err
+	}
+	if reason, seen := c.watch.Fatal(); seen {
+		return &SessionEnded{Reason: reason, Err: err}
+	}
+	if errors.Is(err, io.EOF) {
+		// Worth saying rather than leaving as a bare EOF: RouterOS always sends
+		// `!fatal` before closing a session itself, so a close without one came
+		// from somewhere else — the path between, or the TCP connection going.
+		return fmt.Errorf("connection closed without a !fatal from the router: %w", err)
+	}
 	return err
 }
+
+// SessionEnded is a connection the ROUTER ended, with the reason it sent.
+type SessionEnded struct {
+	Reason string
+	Err    error
+}
+
+func (e *SessionEnded) Error() string {
+	if e.Reason == "" {
+		return fmt.Sprintf("router ended the session without giving a reason (%v)", e.Err)
+	}
+	// %q, because the reason is router-supplied text on its way into a log line:
+	// a newline in it must not be able to start a line of its own.
+	return fmt.Sprintf("router ended the session: %q (%v)", e.Reason, e.Err)
+}
+
+func (e *SessionEnded) Unwrap() error { return e.Err }
 
 func (c *Client) err() error {
 	c.mu.Lock()
@@ -398,6 +663,26 @@ func (c *Client) err() error {
 	if c.closed {
 		return errors.New("routeros: connection closed")
 	}
+	return c.fatal
+}
+
+// Err is WHY this connection stopped being usable: the transport failure recorded
+// — a read error, a reset, a protocol or parse failure — or nil if none was. When
+// the router ended the session it is a *SessionEnded carrying the reason it sent;
+// an EOF with no `!fatal` before it says so. A router's `!trap` is not one of
+// these, and neither is a command timeout.
+//
+// ── IT DELIBERATELY IGNORES `closed`, UNLIKE err() ─────────────────────────
+//
+// `err()` answers "may I use this connection", so a locally closed one reports
+// "connection closed" and the cause is lost. This answers "what happened to it",
+// and the caller is the session's connect loop, which CLOSES the client it is
+// abandoning — see internal/session. Reporting the local close there would
+// overwrite the very thing the line is trying to say, and make the reading
+// order load-bearing.
+func (c *Client) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.fatal
 }
 
